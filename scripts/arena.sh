@@ -147,12 +147,25 @@ build_prompt() {
   local is_last=$5
 
   # 用 python 做模板替换，避免 sed 特殊字符问题
-  local prompt
-  prompt=$(python3 - "$TEMPLATE" "$role" "$TOPIC" "$opponent_text" "$round" "$total" "$is_last" << 'PYEOF'
-import sys
-template, role, topic, opponent, rnd, total, is_last = sys.argv[1:8]
+  # 用临时文件传参，避免 ARG_MAX 和 ps 暴露
+  local tmpfile_tpl tmpfile_opp
+  tmpfile_tpl=$(mktemp /tmp/bot2bot-tpl-XXXXXX.txt)
+  tmpfile_opp=$(mktemp /tmp/bot2bot-opp-XXXXXX.txt)
+  printf '%s' "$TEMPLATE" > "$tmpfile_tpl"
+  printf '%s' "$opponent_text" > "$tmpfile_opp"
 
-prompt = template.replace("{{role}}", role).replace("{{topic}}", topic)
+  local prompt
+  prompt=$(python3 - "$tmpfile_tpl" "$role" "$TOPIC" "$tmpfile_opp" "$round" "$total" "$is_last" << 'PYEOF'
+import sys
+
+tpl_file, role, topic, opp_file, rnd, total, is_last = sys.argv[1:8]
+
+with open(tpl_file) as f:
+    prompt = f.read()
+with open(opp_file) as f:
+    opponent = f.read().strip()
+
+prompt = prompt.replace("{{role}}", role).replace("{{topic}}", topic)
 
 if opponent:
     prompt += f"\n\n---\n对方上一轮的发言：\n{opponent}"
@@ -165,6 +178,7 @@ else:
 print(prompt)
 PYEOF
   )
+  rm -f "$tmpfile_tpl" "$tmpfile_opp"
   echo "$prompt"
 }
 
@@ -181,11 +195,18 @@ call_bot() {
 
   local result=""
   local exit_code=0
+  local msg_content
+  msg_content=$(cat "$tmpfile")
 
+  # 从 command 模板中提取实际命令并执行
+  # 支持配置中自定义 agent 名称和参数
   if echo "$cmd_template" | grep -q "openclaw agent"; then
-    result=$($TIMEOUT_CMD "$timeout_sec" openclaw agent --agent main --message "$(cat "$tmpfile")" --json 2>/dev/null) || exit_code=$?
+    local agent_id
+    agent_id=$(echo "$cmd_template" | sed -n 's/.*--agent  *\([^ ]*\).*/\1/p')
+    if [[ -z "$agent_id" ]]; then agent_id="main"; fi
+    result=$($TIMEOUT_CMD "$timeout_sec" openclaw agent --agent "$agent_id" --message "$msg_content" --json 2>/dev/null) || exit_code=$?
   elif echo "$cmd_template" | grep -q "hermes chat"; then
-    result=$($TIMEOUT_CMD "$timeout_sec" hermes chat -q "$(cat "$tmpfile")" -Q 2>/dev/null) || exit_code=$?
+    result=$($TIMEOUT_CMD "$timeout_sec" hermes chat -q "$msg_content" -Q 2>/dev/null) || exit_code=$?
   else
     echo "❌ 不支持的命令模板: $cmd_template" >&2
     rm -f "$tmpfile"
@@ -220,11 +241,13 @@ send_feishu_message() {
   tmpfile=$(mktemp /tmp/bot2bot-send-XXXXXX.txt)
   printf '%s' "$text" > "$tmpfile"
 
+  # 通过环境变量传 token，避免在 ps 中暴露
   local msg_id
-  msg_id=$(python3 - "$token" "$chat_id" "$tmpfile" "$reply_to" "$bot_name" "$round" "$total" << 'PYEOF'
-import sys, json, urllib.request, urllib.error
+  msg_id=$(BOT2BOT_TOKEN="$token" python3 - "$chat_id" "$tmpfile" "$reply_to" "$bot_name" "$round" "$total" << 'PYEOF'
+import sys, os, json, urllib.request, urllib.error
 
-token, chat_id, textfile, reply_to, bot_name, rnd, total = sys.argv[1:8]
+token = os.environ["BOT2BOT_TOKEN"]
+chat_id, textfile, reply_to, bot_name, rnd, total = sys.argv[1:7]
 
 with open(textfile) as f:
     text = f.read().strip()
@@ -289,9 +312,9 @@ echo "轮次: $ROUNDS"
 echo ""
 
 LAST_MSG_ID=""
+LAST_GOOD_MSG_ID=""
 LAST_TEXT=""
 CONSENSUS=false
-DISCUSSION_LOG=""
 
 # 确定先后顺序
 if [[ "$FIRST" == "b" ]]; then
@@ -319,16 +342,20 @@ for round in $(seq 1 "$ROUNDS"); do
   fi
 
   echo "$NAME_A: ${TEXT_A:0:100}..."
-  DISCUSSION_LOG+="[$NAME_A] $TEXT_A"$'\n\n'
 
-  # 刷新 token
   TOKEN_A=$(get_token "$APP_ID_A" "$APP_SECRET_A" 2>/dev/null) || true
 
-  LAST_MSG_ID=$(send_feishu_message "$TOKEN_A" "$CHAT_ID" "$TEXT_A" "$LAST_MSG_ID" "$NAME_A" "$round" "$ROUNDS")
-  if [[ -n "$LAST_MSG_ID" ]]; then
+  # reply 链容错：发送失败时回退到上一条成功的 msg_id
+  reply_target="${LAST_MSG_ID:-$LAST_GOOD_MSG_ID}"
+  new_msg_id=""
+  new_msg_id=$(send_feishu_message "$TOKEN_A" "$CHAT_ID" "$TEXT_A" "$reply_target" "$NAME_A" "$round" "$ROUNDS")
+  if [[ -n "$new_msg_id" ]]; then
+    LAST_MSG_ID="$new_msg_id"
+    LAST_GOOD_MSG_ID="$new_msg_id"
     echo "  → 已发到群里"
   else
-    echo "  ⚠️ 发送失败，尝试继续"
+    echo "  ⚠️ 发送失败，讨论内容仍会继续"
+    LAST_MSG_ID=""
   fi
 
   if check_consensus "$TEXT_A"; then
@@ -350,15 +377,18 @@ for round in $(seq 1 "$ROUNDS"); do
   fi
 
   echo "$NAME_B: ${TEXT_B:0:100}..."
-  DISCUSSION_LOG+="[$NAME_B] $TEXT_B"$'\n\n'
 
   TOKEN_B=$(get_token "$APP_ID_B" "$APP_SECRET_B" 2>/dev/null) || true
 
-  LAST_MSG_ID=$(send_feishu_message "$TOKEN_B" "$CHAT_ID" "$TEXT_B" "$LAST_MSG_ID" "$NAME_B" "$round" "$ROUNDS")
-  if [[ -n "$LAST_MSG_ID" ]]; then
+  reply_target="${LAST_MSG_ID:-$LAST_GOOD_MSG_ID}"
+  new_msg_id=$(send_feishu_message "$TOKEN_B" "$CHAT_ID" "$TEXT_B" "$reply_target" "$NAME_B" "$round" "$ROUNDS")
+  if [[ -n "$new_msg_id" ]]; then
+    LAST_MSG_ID="$new_msg_id"
+    LAST_GOOD_MSG_ID="$new_msg_id"
     echo "  → 已发到群里"
   else
-    echo "  ⚠️ 发送失败，尝试继续"
+    echo "  ⚠️ 发送失败，讨论内容仍会继续"
+    LAST_MSG_ID=""
   fi
 
   if check_consensus "$TEXT_B"; then
@@ -381,10 +411,11 @@ else
   END_MSG="⏹ 讨论结束 — 已完成 ${ROUNDS} 轮"
 fi
 
-# 发结束消息
+# 发结束消息（回退到最后成功的 msg_id）
 TOKEN_A=$(get_token "$APP_ID_A" "$APP_SECRET_A" 2>/dev/null) || true
-if [[ -n "$LAST_MSG_ID" ]]; then
-  send_feishu_message "$TOKEN_A" "$CHAT_ID" "$END_MSG" "$LAST_MSG_ID" "" "end" "" >/dev/null 2>&1 || true
+end_reply="${LAST_MSG_ID:-$LAST_GOOD_MSG_ID}"
+if [[ -n "$end_reply" ]]; then
+  send_feishu_message "$TOKEN_A" "$CHAT_ID" "$END_MSG" "$end_reply" "" "end" "" >/dev/null 2>&1 || true
 fi
 
 echo "完成。"
