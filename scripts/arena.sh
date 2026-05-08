@@ -100,10 +100,18 @@ APP_ID_A=$(get_participant 0 bot_app_id)
 APP_SECRET_A=$(get_participant 0 bot_app_secret)
 APP_ID_B=$(get_participant 1 bot_app_id)
 APP_SECRET_B=$(get_participant 1 bot_app_secret)
+TYPE_A=$(get_participant 0 type)
+TYPE_B=$(get_participant 1 type)
 CMD_A=$(get_participant 0 command)
 CMD_B=$(get_participant 1 command)
 PARSE_A=$(get_participant 0 parse)
 PARSE_B=$(get_participant 1 parse)
+ENDPOINT_A=$(get_participant 0 endpoint)
+ENDPOINT_B=$(get_participant 1 endpoint)
+API_KEY_A=$(get_participant 0 api_key)
+API_KEY_B=$(get_participant 1 api_key)
+MODEL_A=$(get_participant 0 model)
+MODEL_B=$(get_participant 1 model)
 
 if [[ -z "$ROLE_A" ]]; then ROLE_A="参与者"; fi
 if [[ -z "$ROLE_B" ]]; then ROLE_B="参与者"; fi
@@ -182,8 +190,26 @@ PYEOF
   echo "$prompt"
 }
 
-# --- 调用 bot CLI ---
+# --- 调用 bot（自动选择 local-cli 或 http-api）---
 call_bot() {
+  local bot_type=$1
+  local cmd_template=$2
+  local parse_cmd=$3
+  local message=$4
+  local timeout_sec=$5
+  local endpoint=$6
+  local api_key=$7
+  local model=$8
+
+  if [[ "$bot_type" == "http-api" ]]; then
+    call_bot_http "$endpoint" "$api_key" "$model" "$message" "$timeout_sec"
+  else
+    call_bot_cli "$cmd_template" "$parse_cmd" "$message" "$timeout_sec"
+  fi
+}
+
+# local-cli 模式
+call_bot_cli() {
   local cmd_template=$1
   local parse_cmd=$2
   local message=$3
@@ -198,8 +224,6 @@ call_bot() {
   local msg_content
   msg_content=$(cat "$tmpfile")
 
-  # 从 command 模板中提取实际命令并执行
-  # 支持配置中自定义 agent 名称和参数
   if echo "$cmd_template" | grep -q "openclaw agent"; then
     local agent_id
     agent_id=$(echo "$cmd_template" | sed -n 's/.*--agent  *\([^ ]*\).*/\1/p')
@@ -225,6 +249,79 @@ call_bot() {
   else
     echo "$result"
   fi
+}
+
+# http-api 模式（OpenAI 兼容接口）
+call_bot_http() {
+  local endpoint=$1
+  local api_key=$2
+  local model=$3
+  local message=$4
+  local timeout_sec=$5
+
+  if [[ -z "$endpoint" ]]; then
+    echo "❌ http-api 模式需要配置 endpoint" >&2
+    return 1
+  fi
+
+  if [[ -z "$model" ]]; then model="hermes-agent"; fi
+
+  local tmpfile
+  tmpfile=$(mktemp /tmp/bot2bot-http-XXXXXX.json)
+
+  # 构造 OpenAI 兼容请求体
+  python3 - "$message" "$model" "$tmpfile" << 'PYEOF'
+import sys, json
+message, model, outfile = sys.argv[1:4]
+body = {
+    "model": model,
+    "messages": [{"role": "user", "content": message}],
+    "stream": False
+}
+with open(outfile, 'w') as f:
+    json.dump(body, f, ensure_ascii=False)
+PYEOF
+
+  local auth_header=""
+  if [[ -n "$api_key" ]]; then
+    auth_header="Authorization: Bearer $api_key"
+  fi
+
+  local resp
+  resp=$(curl -s --max-time "$timeout_sec" \
+    -X POST "$endpoint" \
+    -H "Content-Type: application/json" \
+    ${auth_header:+-H "$auth_header"} \
+    -d @"$tmpfile" 2>/dev/null)
+
+  rm -f "$tmpfile"
+
+  if [[ -z "$resp" ]]; then
+    echo "[超时或调用失败]"
+    return 1
+  fi
+
+  # 从 OpenAI 兼容响应中提取 content
+  local content
+  content=$(echo "$resp" | python3 -c "
+import sys, json
+try:
+    d = json.load(sys.stdin)
+    choices = d.get('choices', [])
+    if choices:
+        print(choices[0].get('message', {}).get('content', ''))
+    else:
+        print(d.get('error', {}).get('message', '[API 返回无内容]'))
+except:
+    print('[响应解析失败]')
+" 2>/dev/null)
+
+  if [[ -z "$content" || "$content" == "[API 返回无内容]" || "$content" == "[响应解析失败]" ]]; then
+    echo "[HTTP API 调用失败]"
+    return 1
+  fi
+
+  echo "$content"
 }
 
 # --- 发送飞书消息（带错误处理）---
@@ -318,13 +415,17 @@ CONSENSUS=false
 
 # 确定先后顺序
 if [[ "$FIRST" == "b" ]]; then
-  TMP_NAME=$NAME_A; NAME_A=$NAME_B; NAME_B=$TMP_NAME
-  TMP_ROLE=$ROLE_A; ROLE_A=$ROLE_B; ROLE_B=$TMP_ROLE
-  TMP_TOKEN=$TOKEN_A; TOKEN_A=$TOKEN_B; TOKEN_B=$TMP_TOKEN
-  TMP_CMD=$CMD_A; CMD_A=$CMD_B; CMD_B=$TMP_CMD
-  TMP_PARSE=$PARSE_A; PARSE_A=$PARSE_B; PARSE_B=$TMP_PARSE
-  TMP_APPID=$APP_ID_A; APP_ID_A=$APP_ID_B; APP_ID_B=$TMP_APPID
-  TMP_SECRET=$APP_SECRET_A; APP_SECRET_A=$APP_SECRET_B; APP_SECRET_B=$TMP_SECRET
+  TMP=$NAME_A; NAME_A=$NAME_B; NAME_B=$TMP
+  TMP=$ROLE_A; ROLE_A=$ROLE_B; ROLE_B=$TMP
+  TMP=$TOKEN_A; TOKEN_A=$TOKEN_B; TOKEN_B=$TMP
+  TMP=$TYPE_A; TYPE_A=$TYPE_B; TYPE_B=$TMP
+  TMP=$CMD_A; CMD_A=$CMD_B; CMD_B=$TMP
+  TMP=$PARSE_A; PARSE_A=$PARSE_B; PARSE_B=$TMP
+  TMP=$APP_ID_A; APP_ID_A=$APP_ID_B; APP_ID_B=$TMP
+  TMP=$APP_SECRET_A; APP_SECRET_A=$APP_SECRET_B; APP_SECRET_B=$TMP
+  TMP=$ENDPOINT_A; ENDPOINT_A=$ENDPOINT_B; ENDPOINT_B=$TMP
+  TMP=$API_KEY_A; API_KEY_A=$API_KEY_B; API_KEY_B=$TMP
+  TMP=$MODEL_A; MODEL_A=$MODEL_B; MODEL_B=$TMP
 fi
 
 for round in $(seq 1 "$ROUNDS"); do
@@ -334,7 +435,7 @@ for round in $(seq 1 "$ROUNDS"); do
   # --- Bot A 发言 ---
   echo "--- 第 ${round}/${ROUNDS} 轮 · $NAME_A ---"
   PROMPT_A=$(build_prompt "$ROLE_A" "$LAST_TEXT" "$round" "$ROUNDS" "$IS_LAST")
-  TEXT_A=$(call_bot "$CMD_A" "$PARSE_A" "$PROMPT_A" "$TIMEOUT") || true
+  TEXT_A=$(call_bot "$TYPE_A" "$CMD_A" "$PARSE_A" "$PROMPT_A" "$TIMEOUT" "$ENDPOINT_A" "$API_KEY_A" "$MODEL_A") || true
 
   if [[ -z "$TEXT_A" || "$TEXT_A" == "[超时或调用失败]" ]]; then
     echo "⚠️ $NAME_A 回复失败或超时，跳过本轮"
@@ -369,7 +470,7 @@ for round in $(seq 1 "$ROUNDS"); do
   # --- Bot B 发言 ---
   echo "--- 第 ${round}/${ROUNDS} 轮 · $NAME_B ---"
   PROMPT_B=$(build_prompt "$ROLE_B" "$LAST_TEXT" "$round" "$ROUNDS" "$IS_LAST")
-  TEXT_B=$(call_bot "$CMD_B" "$PARSE_B" "$PROMPT_B" "$TIMEOUT") || true
+  TEXT_B=$(call_bot "$TYPE_B" "$CMD_B" "$PARSE_B" "$PROMPT_B" "$TIMEOUT" "$ENDPOINT_B" "$API_KEY_B" "$MODEL_B") || true
 
   if [[ -z "$TEXT_B" || "$TEXT_B" == "[超时或调用失败]" ]]; then
     echo "⚠️ $NAME_B 回复失败或超时，跳过本轮"

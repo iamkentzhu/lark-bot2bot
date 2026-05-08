@@ -117,6 +117,22 @@ EOF
       echo "❌ $NAME CLI: $BIN 不可用"
       ERRORS=$((ERRORS + 1))
     fi
+  elif [[ "$TYPE" == "http-api" ]]; then
+    ENDPOINT=$(echo "$CONFIG_JSON" | python3 -c "import sys,json;p=json.load(sys.stdin)['participants'][$i];print(p.get('endpoint',''))")
+    if [[ -z "$ENDPOINT" ]]; then
+      echo "❌ $NAME: http-api 模式需要配置 endpoint"
+      ERRORS=$((ERRORS + 1))
+    else
+      # 尝试 health check
+      HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 "${ENDPOINT%/chat/completions}/health" 2>/dev/null || echo "000")
+      if [[ "$HTTP_STATUS" == "200" ]]; then
+        echo "✅ $NAME HTTP API: $ENDPOINT (health OK)"
+      else
+        echo "⚠️ $NAME HTTP API: $ENDPOINT (health 返回 $HTTP_STATUS，可能仍可用)"
+      fi
+    fi
+  else
+    echo "⚠️ $NAME: 未知 type '$TYPE'，支持 local-cli 或 http-api"
   fi
 done
 

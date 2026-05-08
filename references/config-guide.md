@@ -54,11 +54,48 @@ defaults:
 
 ### 支持的框架组合
 
-| Bot A | Bot B | command 示例 |
-|-------|-------|-------------|
-| OpenClaw | Hermes | `openclaw agent ...` / `hermes chat ...` |
-| OpenClaw | OpenClaw | `openclaw agent --agent agentA ...` / `openclaw agent --agent agentB ...` |
-| Hermes | Hermes | `hermes chat -q '...' -Q` / `hermes chat -q '...' -Q --session xxx` |
+**同机器（local-cli）**：
+
+| Bot A | Bot B | 说明 |
+|-------|-------|------|
+| OpenClaw | Hermes | `openclaw agent ...` + `hermes chat ...` |
+| OpenClaw | OpenClaw | 不同 agent ID |
+| Hermes | Hermes | 不同 session |
+
+**异地（http-api）**：
+
+| Bot A (本地) | Bot B (远程) | 说明 |
+|-------------|-------------|------|
+| OpenClaw | Hermes | Bot B 启用 API server，本地通过 HTTP 调用 |
+| Hermes | Hermes | 两台都启用 API server |
+| OpenClaw | OpenClaw | ❌ OpenClaw 暂不支持 HTTP chat API |
+
+**异地 Hermes 配置示例**（远程机器）：
+```bash
+# 在远程 Hermes 的 .env 中加：
+API_SERVER_ENABLED=true
+API_SERVER_KEY=your-secret-key
+# 重启 hermes gateway
+```
+
+**本地 config.yaml 异地配置示例**：
+```yaml
+participants:
+  - name: Lucie
+    bot_app_id: "cli_xxx"
+    bot_app_secret: "xxx"
+    type: local-cli
+    command: "openclaw agent --agent main --message '{message}' --json"
+    parse: "jq -r '.result.payloads[0].text'"
+
+  - name: Lumi
+    bot_app_id: "cli_xxx"
+    bot_app_secret: "xxx"
+    type: http-api
+    endpoint: "http://remote-host:8642/v1/chat/completions"
+    api_key: "your-secret-key"
+    model: "hermes-agent"
+```
 
 ## 首次配置引导
 
