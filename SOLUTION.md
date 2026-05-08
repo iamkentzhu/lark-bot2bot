@@ -197,51 +197,65 @@ openclaw    hermes        ← 通过 CLI 调用 LLM
 围绕主题展开，对有趣观点追问或深入探讨，有不同看法直接说。
 ```
 
-## 四、可扩展性预留
+## 四、支持的场景组合
 
-### 4.1 参与方类型扩展
+### 4.1 同机器（local-cli）
 
-脚本支持两种调用模式，通过配置切换：
+编排器和所有参与 bot 在同一台机器上，通过本地 CLI 调用：
+
+| 组合 | 支持 | 说明 |
+|------|------|------|
+| OpenClaw + Hermes | ✅ | 默认场景，两个不同框架的 bot 协作 |
+| OpenClaw + OpenClaw | ✅ | 需使用不同的 agent ID 区分 |
+| Hermes + Hermes | ✅ | 需使用不同的 session 区分 |
+
+配置示例：
 
 ```yaml
 participants:
   - name: Lucie
     bot_app_id: cli_a927dc45c978dbcc
     bot_app_secret: "***"
-    type: local-cli                    # v1：同机器 CLI
+    type: local-cli
     command: "openclaw agent --agent main --message '{message}' --json"
     parse: "jq '.result.payloads[0].text'"
 
   - name: Lumi
     bot_app_id: cli_a95222a337f8dcd3
     bot_app_secret: "***"
-    type: local-cli                    # v1：同机器 CLI
+    type: local-cli
     command: "hermes chat -q '{message}' -Q"
     parse: "grep -v '^session_id:' | grep -v '^$'"
 ```
 
-**v2 扩展（跨机器 HTTP API）**：
+### 4.2 异地（http-api）
+
+编排器在本地，远程 bot 通过 HTTP API 调用：
+
+| 组合 | 支持 | 说明 |
+|------|------|------|
+| OpenClaw(本地) + Hermes(远程) | ✅ | 本地 CLI 调 OpenClaw，HTTP API 调远程 Hermes |
+| Hermes(本地) + Hermes(远程) | ✅ | 本地 CLI + 远程 HTTP API |
+| OpenClaw + OpenClaw 异地 | ❌ | OpenClaw 暂不支持 HTTP chat API |
+
+异地场景需在远程 Hermes 的 `.env` 中启用 API server：
+
+```
+API_SERVER_ENABLED=true
+API_SERVER_KEY=your-secret-key
+```
+
+远程 Hermes 配置示例：
 
 ```yaml
   - name: Lumi
     bot_app_id: cli_a95222a337f8dcd3
     bot_app_secret: "***"
-    type: http-api                     # v2：远程 HTTP
+    type: http-api
     endpoint: "http://lumi-host:8642/v1/chat/completions"
     api_key: "your-secret-key"
     model: "hermes-agent"
 ```
-
-Hermes 已原生支持 OpenAI 兼容 HTTP API（端口 8642，需在 .env 中设 `API_SERVER_ENABLED=true`）。OpenClaw 的 HTTP chat API 待后续适配。
-
-### 4.2 框架组合支持
-
-| 组合 | v1 CLI | v2 HTTP |
-|------|--------|---------|
-| OpenClaw + Hermes | ✅ | Hermes ✅ / OpenClaw 待适配 |
-| OpenClaw + OpenClaw | ✅（不同 agent ID） | 待适配 |
-| Hermes + Hermes | ✅（不同 session） | ✅ |
-| 任意框架 | 只要有 CLI 命令 | 只要有 HTTP API |
 
 ### 4.3 讨论模式扩展
 
