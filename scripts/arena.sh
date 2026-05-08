@@ -208,6 +208,17 @@ call_bot() {
   fi
 }
 
+is_loopback_endpoint() {
+  local endpoint=$1
+  python3 - "$endpoint" <<'PYEOF'
+import sys
+from urllib.parse import urlparse
+
+host = (urlparse(sys.argv[1]).hostname or "").strip().lower()
+print("1" if host in {"localhost", "127.0.0.1", "::1"} else "0")
+PYEOF
+}
+
 # local-cli 模式
 call_bot_cli() {
   local cmd_template=$1
@@ -264,15 +275,23 @@ call_bot_http() {
     return 1
   fi
 
+  endpoint=${endpoint%/}
   if [[ -z "$model" ]]; then model="hermes-agent"; fi
 
-  local tmpfile
+  local msgfile tmpfile respfile keyfile
+  msgfile=$(mktemp /tmp/bot2bot-http-msg-XXXXXX.txt)
   tmpfile=$(mktemp /tmp/bot2bot-http-XXXXXX.json)
+  respfile=$(mktemp /tmp/bot2bot-http-resp-XXXXXX.json)
+  keyfile=$(mktemp /tmp/bot2bot-http-key-XXXXXX.txt)
+  printf '%s' "$message" > "$msgfile"
+  printf '%s' "$api_key" > "$keyfile"
 
   # 构造 OpenAI 兼容请求体
-  python3 - "$message" "$model" "$tmpfile" << 'PYEOF'
+  python3 - "$msgfile" "$model" "$tmpfile" << 'PYEOF'
 import sys, json
-message, model, outfile = sys.argv[1:4]
+msgfile, model, outfile = sys.argv[1:4]
+with open(msgfile, encoding='utf-8') as f:
+    message = f.read()
 body = {
     "model": model,
     "messages": [{"role": "user", "content": message}],
@@ -282,42 +301,121 @@ with open(outfile, 'w') as f:
     json.dump(body, f, ensure_ascii=False)
 PYEOF
 
-  local auth_header=""
-  if [[ -n "$api_key" ]]; then
-    auth_header="Authorization: Bearer $api_key"
-  fi
+  local loopback
+  loopback=$(is_loopback_endpoint "$endpoint")
 
-  local resp
-  resp=$(curl -s --max-time "$timeout_sec" \
-    -X POST "$endpoint" \
-    -H "Content-Type: application/json" \
-    ${auth_header:+-H "$auth_header"} \
-    -d @"$tmpfile" 2>/dev/null)
+  local http_status
+  http_status=$(python3 - "$endpoint" "$tmpfile" "$respfile" "$timeout_sec" "$loopback" "$keyfile" <<'PYEOF'
+import sys, urllib.request, urllib.error
 
-  rm -f "$tmpfile"
+endpoint, bodyfile, respfile, timeout_sec, loopback, keyfile = sys.argv[1:7]
+headers = {"Content-Type": "application/json"}
+with open(keyfile, encoding="utf-8") as f:
+    api_key = f.read()
+if api_key:
+    headers["Authorization"] = f"Bearer {api_key}"
 
-  if [[ -z "$resp" ]]; then
+with open(bodyfile, "rb") as f:
+    body = f.read()
+
+request = urllib.request.Request(endpoint, data=body, headers=headers, method="POST")
+opener = urllib.request.build_opener(
+    urllib.request.ProxyHandler({})
+) if loopback == "1" else urllib.request.build_opener()
+
+try:
+    with opener.open(request, timeout=float(timeout_sec)) as resp:
+        raw = resp.read()
+        status = getattr(resp, "status", resp.getcode())
+except urllib.error.HTTPError as exc:
+    raw = exc.read()
+    status = exc.code
+except Exception as exc:
+    sys.stderr.write(f"TRANSPORT_ERROR:{exc}\n")
+    sys.exit(1)
+
+with open(respfile, "wb") as f:
+    f.write(raw)
+
+print(status)
+PYEOF
+  ) || {
+    rm -f "$msgfile" "$tmpfile" "$respfile" "$keyfile"
+    echo "[超时或调用失败]"
+    return 1
+  }
+
+  rm -f "$msgfile" "$tmpfile" "$keyfile"
+
+  if [[ ! "$http_status" =~ ^2[0-9][0-9]$ ]]; then
+    local api_error
+    api_error=$(python3 - "$respfile" <<'PYEOF'
+import json, sys
+
+try:
+    with open(sys.argv[1], encoding='utf-8') as f:
+        data = json.load(f)
+except Exception:
+    print("")
+    raise SystemExit(0)
+
+error = data.get("error")
+if isinstance(error, dict):
+    print(error.get("message") or error.get("code") or "")
+elif error:
+    print(str(error))
+else:
+    print(data.get("message", ""))
+PYEOF
+    )
+    rm -f "$respfile"
+    if [[ -n "$api_error" ]]; then
+      echo "❌ HTTP API 返回 $http_status: $api_error" >&2
+    else
+      echo "❌ HTTP API 返回 $http_status" >&2
+    fi
     echo "[超时或调用失败]"
     return 1
   fi
 
   # 从 OpenAI 兼容响应中提取 content
   local content
-  content=$(echo "$resp" | python3 -c "
+  content=$(python3 - "$respfile" <<'PYEOF'
 import sys, json
+
+def flatten_content(content):
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict):
+                text = item.get('text')
+                if text:
+                    parts.append(str(text))
+        return '\n'.join(part for part in parts if part)
+    return ''
+
 try:
-    d = json.load(sys.stdin)
+    with open(sys.argv[1], encoding='utf-8') as f:
+        d = json.load(f)
     choices = d.get('choices', [])
     if choices:
-        print(choices[0].get('message', {}).get('content', ''))
+        print(flatten_content(choices[0].get('message', {}).get('content', '')))
     else:
-        print(d.get('error', {}).get('message', '[API 返回无内容]'))
-except:
+        print('[API 返回无内容]')
+except Exception:
     print('[响应解析失败]')
-" 2>/dev/null)
+PYEOF
+  )
+
+  rm -f "$respfile"
 
   if [[ -z "$content" || "$content" == "[API 返回无内容]" || "$content" == "[响应解析失败]" ]]; then
-    echo "[HTTP API 调用失败]"
+    echo "❌ HTTP API 响应解析失败" >&2
+    echo "[超时或调用失败]"
     return 1
   fi
 

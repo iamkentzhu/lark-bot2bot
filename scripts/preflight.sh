@@ -22,6 +22,64 @@ fi
 echo "=== lark-bot2bot preflight ==="
 ERRORS=0
 
+build_health_urls() {
+  python3 - "$1" <<'PYEOF'
+import sys
+from urllib.parse import urlparse, urlunparse
+
+endpoint = sys.argv[1].strip()
+parsed = urlparse(endpoint)
+path = parsed.path.rstrip("/")
+
+prefixes = []
+if path.endswith("/chat/completions"):
+    prefixes.append(path[: -len("/chat/completions")])
+elif path.endswith("/responses"):
+    prefixes.append(path[: -len("/responses")])
+else:
+    prefixes.append(path)
+
+prefixes.append("")
+
+seen = set()
+for prefix in prefixes:
+    prefix = prefix.rstrip("/")
+    candidates = []
+    if prefix:
+        candidates.append(f"{prefix}/health")
+        if prefix == "/v1":
+            candidates.append("/health")
+    else:
+        candidates.append("/health")
+    for candidate in candidates:
+        url = urlunparse(parsed._replace(path=candidate, params="", query="", fragment=""))
+        if url not in seen:
+            seen.add(url)
+            print(url)
+PYEOF
+}
+
+is_loopback_url() {
+  python3 - "$1" <<'PYEOF'
+import sys
+from urllib.parse import urlparse
+
+host = (urlparse(sys.argv[1]).hostname or "").strip().lower()
+print("1" if host in {"localhost", "127.0.0.1", "::1"} else "0")
+PYEOF
+}
+
+curl_http_status() {
+  local url=$1
+  shift
+  local status
+  status=$(curl "$@" "$url" 2>/dev/null || true)
+  if [[ -z "$status" ]]; then
+    status="000"
+  fi
+  printf '%s\n' "$status"
+}
+
 # 检查依赖
 for dep in python3 curl jq; do
   if command -v "$dep" &>/dev/null; then
@@ -123,12 +181,26 @@ EOF
       echo "❌ $NAME: http-api 模式需要配置 endpoint"
       ERRORS=$((ERRORS + 1))
     else
-      # 尝试 health check
-      HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 "${ENDPOINT%/chat/completions}/health" 2>/dev/null || echo "000")
+      LOOPBACK=$(is_loopback_url "$ENDPOINT")
+      CURL_ARGS=(-s -o /dev/null -w "%{http_code}" --max-time 5)
+      if [[ "$LOOPBACK" == "1" ]]; then
+        CURL_ARGS+=(--noproxy "*")
+      fi
+      HTTP_STATUS="000"
+      HEALTH_URL=""
+      while IFS= read -r candidate; do
+        [[ -z "$candidate" ]] && continue
+        status=$(curl_http_status "$candidate" "${CURL_ARGS[@]}")
+        HEALTH_URL="$candidate"
+        HTTP_STATUS="$status"
+        if [[ "$status" == "200" ]]; then
+          break
+        fi
+      done < <(build_health_urls "$ENDPOINT")
       if [[ "$HTTP_STATUS" == "200" ]]; then
-        echo "✅ $NAME HTTP API: $ENDPOINT (health OK)"
+        echo "✅ $NAME HTTP API: $ENDPOINT (health OK: $HEALTH_URL)"
       else
-        echo "⚠️ $NAME HTTP API: $ENDPOINT (health 返回 $HTTP_STATUS，可能仍可用)"
+        echo "⚠️ $NAME HTTP API: $ENDPOINT (health $HEALTH_URL 返回 ${HTTP_STATUS}，可能仍可用)"
       fi
     fi
   else
