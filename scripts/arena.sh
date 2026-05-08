@@ -510,6 +510,7 @@ LAST_MSG_ID=""
 LAST_GOOD_MSG_ID=""
 LAST_TEXT=""
 CONSENSUS=false
+DISCUSSION_LOG_FILE=$(mktemp /tmp/bot2bot-log-XXXXXX.txt)
 
 # 确定先后顺序
 if [[ "$FIRST" == "b" ]]; then
@@ -541,6 +542,7 @@ for round in $(seq 1 "$ROUNDS"); do
   fi
 
   echo "$NAME_A: ${TEXT_A:0:100}..."
+  printf '[%s] %s\n\n' "$NAME_A" "$TEXT_A" >> "$DISCUSSION_LOG_FILE"
 
   TOKEN_A=$(get_token "$APP_ID_A" "$APP_SECRET_A" 2>/dev/null) || true
 
@@ -576,6 +578,7 @@ for round in $(seq 1 "$ROUNDS"); do
   fi
 
   echo "$NAME_B: ${TEXT_B:0:100}..."
+  printf '[%s] %s\n\n' "$NAME_B" "$TEXT_B" >> "$DISCUSSION_LOG_FILE"
 
   TOKEN_B=$(get_token "$APP_ID_B" "$APP_SECRET_B" 2>/dev/null) || true
 
@@ -600,14 +603,39 @@ for round in $(seq 1 "$ROUNDS"); do
   echo ""
 done
 
-# --- 结束 ---
+# --- 生成摘要 ---
 echo ""
+echo "=== 生成讨论摘要 ==="
+
+SUMMARY_PROMPT="请为以下讨论生成一段简洁的摘要（3-5句话），包含：双方的核心观点、主要分歧、最终结论或共识。使用纯文本，不用 markdown 格式。
+
+话题：$TOPIC
+
+讨论记录：
+$(cat "$DISCUSSION_LOG_FILE")"
+
+SUMMARY=$(call_bot "$TYPE_A" "$CMD_A" "$PARSE_A" "$SUMMARY_PROMPT" "$TIMEOUT" "$ENDPOINT_A" "$API_KEY_A" "$MODEL_A" 2>/dev/null) || true
+
+if [[ -z "$SUMMARY" || "$SUMMARY" == "[超时或调用失败]" ]]; then
+  echo "⚠️ 摘要生成失败，跳过"
+  SUMMARY=""
+fi
+
+# --- 结束消息 ---
 if [[ "$CONSENSUS" == "true" ]]; then
   echo "=== 讨论结束（共识达成）==="
-  END_MSG="⏹ 讨论结束 — 双方达成共识"
+  END_HEADER="⏹ 讨论结束 — 双方达成共识"
 else
   echo "=== 讨论结束（${ROUNDS} 轮完成）==="
-  END_MSG="⏹ 讨论结束 — 已完成 ${ROUNDS} 轮"
+  END_HEADER="⏹ 讨论结束 — 已完成 ${ROUNDS} 轮"
+fi
+
+if [[ -n "$SUMMARY" ]]; then
+  END_MSG="${END_HEADER}
+
+${SUMMARY}"
+else
+  END_MSG="$END_HEADER"
 fi
 
 # 发结束消息（回退到最后成功的 msg_id）
@@ -617,4 +645,5 @@ if [[ -n "$end_reply" ]]; then
   send_feishu_message "$TOKEN_A" "$CHAT_ID" "$END_MSG" "$end_reply" "" "end" "" >/dev/null 2>&1 || true
 fi
 
+rm -f "$DISCUSSION_LOG_FILE"
 echo "完成。"
