@@ -200,11 +200,12 @@ call_bot() {
   local endpoint=$6
   local api_key=$7
   local model=$8
+  local session_id=${9:-""}
 
   if [[ "$bot_type" == "http-api" ]]; then
     call_bot_http "$endpoint" "$api_key" "$model" "$message" "$timeout_sec"
   else
-    call_bot_cli "$cmd_template" "$parse_cmd" "$message" "$timeout_sec"
+    call_bot_cli "$cmd_template" "$parse_cmd" "$message" "$timeout_sec" "$session_id"
   fi
 }
 
@@ -225,6 +226,7 @@ call_bot_cli() {
   local parse_cmd=$2
   local message=$3
   local timeout_sec=$4
+  local session_id=${5:-""}
 
   local tmpfile
   tmpfile=$(mktemp /tmp/bot2bot-msg-XXXXXX.txt)
@@ -239,7 +241,11 @@ call_bot_cli() {
     local agent_id
     agent_id=$(echo "$cmd_template" | sed -n 's/.*--agent  *\([^ ]*\).*/\1/p')
     if [[ -z "$agent_id" ]]; then agent_id="main"; fi
-    result=$($TIMEOUT_CMD "$timeout_sec" openclaw agent --agent "$agent_id" --message "$msg_content" --json 2>/dev/null) || exit_code=$?
+    if [[ -n "$session_id" ]]; then
+      result=$($TIMEOUT_CMD "$timeout_sec" openclaw agent --agent "$agent_id" --session-id "$session_id" --message "$msg_content" --json 2>/dev/null) || exit_code=$?
+    else
+      result=$($TIMEOUT_CMD "$timeout_sec" openclaw agent --agent "$agent_id" --message "$msg_content" --json 2>/dev/null) || exit_code=$?
+    fi
   elif echo "$cmd_template" | grep -q "hermes chat"; then
     result=$($TIMEOUT_CMD "$timeout_sec" hermes chat -q "$msg_content" -Q 2>/dev/null) || exit_code=$?
   else
@@ -256,10 +262,24 @@ call_bot_cli() {
   fi
 
   if [[ -n "$parse_cmd" ]]; then
-    echo "$result" | eval "$parse_cmd" || echo "$result"
-  else
-    echo "$result"
+    result=$(echo "$result" | eval "$parse_cmd" || echo "$result")
   fi
+
+  # 过滤 OpenClaw 内部 context 泄露（memories XML、HEARTBEAT 指令等）
+  result=$(python3 -c '
+import sys, re
+text = sys.stdin.read()
+text = re.sub(r"```text\s*\n<memories>.*?</memories>\s*\n```", "", text, flags=re.DOTALL)
+text = re.sub(r"<memories>.*?</memories>", "", text, flags=re.DOTALL)
+text = re.sub(r"user\s*原\s*始\s*query\s*[：:].*", "", text)
+text = re.sub(r"^\s*HEARTBEAT_OK\s*$", "", text, flags=re.MULTILINE)
+text = re.sub(r"Read HEARTBEAT\.md if it exists.*?(?=\n\n|\Z)", "", text, flags=re.DOTALL)
+text = re.sub(r"\n{3,}", "\n\n", text)
+text = text.strip()
+print(text)
+' <<< "$result")
+
+  echo "$result"
 }
 
 # http-api 模式（OpenAI 兼容接口）
@@ -511,6 +531,8 @@ LAST_GOOD_MSG_ID=""
 LAST_TEXT=""
 CONSENSUS=false
 DISCUSSION_LOG_FILE=$(mktemp /tmp/bot2bot-log-XXXXXX.txt)
+SESSION_A="bot2bot-$(uuidgen | tr '[:upper:]' '[:lower:]')"
+SESSION_B="bot2bot-$(uuidgen | tr '[:upper:]' '[:lower:]')"
 
 # 确定先后顺序
 if [[ "$FIRST" == "b" ]]; then
@@ -534,7 +556,7 @@ for round in $(seq 1 "$ROUNDS"); do
   # --- Bot A 发言 ---
   echo "--- 第 ${round}/${ROUNDS} 轮 · $NAME_A ---"
   PROMPT_A=$(build_prompt "$ROLE_A" "$LAST_TEXT" "$round" "$ROUNDS" "$IS_LAST")
-  TEXT_A=$(call_bot "$TYPE_A" "$CMD_A" "$PARSE_A" "$PROMPT_A" "$TIMEOUT" "$ENDPOINT_A" "$API_KEY_A" "$MODEL_A") || true
+  TEXT_A=$(call_bot "$TYPE_A" "$CMD_A" "$PARSE_A" "$PROMPT_A" "$TIMEOUT" "$ENDPOINT_A" "$API_KEY_A" "$MODEL_A" "$SESSION_A") || true
 
   if [[ -z "$TEXT_A" || "$TEXT_A" == "[超时或调用失败]" ]]; then
     echo "⚠️ $NAME_A 回复失败或超时，跳过本轮"
@@ -570,7 +592,7 @@ for round in $(seq 1 "$ROUNDS"); do
   # --- Bot B 发言 ---
   echo "--- 第 ${round}/${ROUNDS} 轮 · $NAME_B ---"
   PROMPT_B=$(build_prompt "$ROLE_B" "$LAST_TEXT" "$round" "$ROUNDS" "$IS_LAST")
-  TEXT_B=$(call_bot "$TYPE_B" "$CMD_B" "$PARSE_B" "$PROMPT_B" "$TIMEOUT" "$ENDPOINT_B" "$API_KEY_B" "$MODEL_B") || true
+  TEXT_B=$(call_bot "$TYPE_B" "$CMD_B" "$PARSE_B" "$PROMPT_B" "$TIMEOUT" "$ENDPOINT_B" "$API_KEY_B" "$MODEL_B" "$SESSION_B") || true
 
   if [[ -z "$TEXT_B" || "$TEXT_B" == "[超时或调用失败]" ]]; then
     echo "⚠️ $NAME_B 回复失败或超时，跳过本轮"
@@ -614,7 +636,7 @@ SUMMARY_PROMPT="请为以下讨论生成一段简洁的摘要（3-5句话），�
 讨论记录：
 $(cat "$DISCUSSION_LOG_FILE")"
 
-SUMMARY=$(call_bot "$TYPE_A" "$CMD_A" "$PARSE_A" "$SUMMARY_PROMPT" "$TIMEOUT" "$ENDPOINT_A" "$API_KEY_A" "$MODEL_A" 2>/dev/null) || true
+SUMMARY=$(call_bot "$TYPE_A" "$CMD_A" "$PARSE_A" "$SUMMARY_PROMPT" "$TIMEOUT" "$ENDPOINT_A" "$API_KEY_A" "$MODEL_A" "$SESSION_A" 2>/dev/null) || true
 
 if [[ -z "$SUMMARY" || "$SUMMARY" == "[超时或调用失败]" ]]; then
   echo "⚠️ 摘要生成失败，跳过"
